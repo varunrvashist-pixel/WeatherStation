@@ -6,20 +6,21 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_VCNL4200.h>   // NEW: VCNL4200 on-site fog sensor
 #include <ArduinoOTA.h>
+#include <time.h>            // NEW: local time, so the Rain column can reset each day
 
 // ---- WiFi Configuration ----
-const char* ssid = "NO_WIFI_4_U";
-const char* password = "NO_WIFI_4_U";
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
 
 // ---- Google Apps Script Web App URL ----
-const char* scriptURL = "https://www.youtube.com/watch?v=8sPl3imQqKk";
+const char* scriptURL = "YOUR_APPS_SCRIPT_WEB_APP_URL";
 
 // ---- OTA Update Settings ----
-const char* otaHostname = "WHY_R_U_LOOKING_HERE";
-const char* otaPassword = "WHY_R_U_LOOKING_HERE";
+const char* otaHostname = "DIYweatherstation";
+const char* otaPassword = "YOUR_OTA_PASSWORD";
 
-Adafruit_BME280 bme;          // primary, shielded — SDO floating/high — 0x77
-Adafruit_BME280 bme2;         // TEMP: unshielded, radiation-shield A/B test — SDO tied to GND — 0x76
+Adafruit_BME280 bme;          // primary, shielded — SDO floating — 0x76
+Adafruit_BME280 bme2;         // TEMP: unshielded, radiation-shield A/B test — SDO tied to 3.3V — 0x77
 bool bme2Present = false;     // tracks whether the second sensor init succeeded, so this
                                // temporary bench-test sensor never halts the station if
                                // it's unplugged or removed once the A/B test is done
@@ -44,7 +45,7 @@ bool vcnl4200Present = false; // NEW: tracks whether init succeeded, so a wiring
 // time real fog or heavy mist actually occurs and compare the logged jump
 // against the margin you picked.
 const float FOG_EWMA_ALPHA     = 0.05;    // baseline smoothing (slow-moving)
-const uint16_t PROX_MARGIN     = 50;      // PLACEHOLDER — tune from real data, see above
+const uint16_t PROX_MARGIN     = 10;      // counts above baseline; paper used 5 (built-in LED) — tune from real data
 const float FOG_HUMIDITY_GATE  = 85.0;    // %RH, from the write-up
 const unsigned long FOG_PERSIST_MS = 120000; // 2 minutes, from the write-up
 
@@ -81,6 +82,11 @@ volatile unsigned long rainClicks = 0;
 volatile unsigned long lastRainTime = 0;
 const unsigned long rainDebounceMs = 200;
 const float inchesPerClick = 0.011;
+
+// NEW: "rain today" bookkeeping. rainClicks keeps counting since boot; the value we
+// report is the clicks since the start of the current local day (Pacific time).
+unsigned long rainClicksAtMidnight = 0;
+int lastRainDay = -1;
 
 void IRAM_ATTR countRainClick() {
   unsigned long now = millis();
@@ -141,6 +147,9 @@ void setup() {
     ArduinoOTA.setPassword(otaPassword);
     ArduinoOTA.begin();
     Serial.println("OTA ready.");
+
+    // NEW: sync the clock (Pacific time, handles daylight saving) for the daily rain reset
+    configTzTime("PST8PDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
   } else {
     Serial.println("\nWiFi failed to connect - continuing offline.");
   }
@@ -222,11 +231,23 @@ String readWindDirection(int* degreesOut) {
   return vaneTable[closestIndex].label;
 }
 
+// Returns inches of rain so far TODAY (resets just after local midnight).
+// A reboot restarts the count from zero, so a mid-day restart under-reports that day.
 float getRainInches() {
   noInterrupts();
   unsigned long clicks = rainClicks;
   interrupts();
-  return clicks * inchesPerClick;
+
+  struct tm t;
+  if (getLocalTime(&t, 0)) {            // false until the clock has synced
+    if (lastRainDay == -1) {
+      lastRainDay = t.tm_yday;          // first sync: everything counted since boot is today's
+    } else if (t.tm_yday != lastRainDay) {
+      lastRainDay = t.tm_yday;          // a new day started
+      rainClicksAtMidnight = clicks;    // start today from zero
+    }
+  }
+  return (clicks - rainClicksAtMidnight) * inchesPerClick;
 }
 
 void loop() {
